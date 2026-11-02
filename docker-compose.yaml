@@ -1,0 +1,271 @@
+
+# ============================================================
+# HEADSCALE SELF-HOSTED VPN STACK
+# ============================================================
+#
+# Components:
+#   1. Headscale        - Self-hosted Tailscale control server
+#   2. Headplane        - Web-based Headscale administration UI
+#   3. Nginx Proxy Mgr  - Reverse proxy and HTTPS management
+#   4. DuckDNS          - Dynamic DNS updater
+#   5. Exporter         - Optional Prometheus monitoring
+#
+# Before deploying:
+#   - Configure the variables in your .env file
+#   - Create Headscale and Headplane config.yaml files
+#   - Configure your public DNS and reverse proxy
+#   - Create the external Docker network (see below)
+#
+# ============================================================
+
+services:
+
+  # ----------------------------------------------------------
+  # HEADPLANE - Headscale Web Administration Interface
+  # ----------------------------------------------------------
+  # Provides a graphical interface for managing Headscale:
+  #   - Users and connected devices
+  #   - Pre-authentication keys
+  #   - DNS and network configuration
+  #   - Headscale server settings
+  #
+  # Accessible at http://SERVER_IP:3303/admin
+  # Or through your configured reverse proxy.
+  # ----------------------------------------------------------
+
+  headplane:
+    image: ghcr.io/tale/headplane:latest
+    container_name: headscale_webui
+    restart: unless-stopped
+
+    ports:
+      # Host port 3303 -> Headplane internal port 3000
+      - "3303:3000"
+
+    volumes:
+      # Headplane application configuration
+      - ${HOME_DIR}/docker/headscale/headplane-config/config.yaml:/etc/headplane/config.yaml
+
+      # Shared Headscale configuration.
+      # Needed for Headplane network/settings management.
+      - ${HOME_DIR}/docker/headscale/headscale-config/config.yaml:/etc/headscale/config.yaml
+
+      # Shared DNS records file for custom DNS management.
+      # Must match the DNS records path in Headscale config.
+      - ${HOME_DIR}/docker/headscale/headscale-config/dns_records.json:/etc/headscale/dns_records.json
+
+      # Persistent Headplane application data
+      - ${HOME_DIR}/docker/headscale/headplane-config/headplane-data:/var/lib/headplane
+
+      # Docker socket enables Headplane to discover and
+      # manage the Headscale container.
+      # WARNING: Even read-only socket mounting grants
+      # significant access to the Docker daemon.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    networks:
+      - headscale-network
+
+    depends_on:
+      # Start Headscale before Headplane.
+      # This does not guarantee Headscale is fully ready.
+      - headscale
+
+    labels:
+      # Optional Dockpeek dashboard shortcut.
+      # Remove if not using Dockpeek.
+      - "dockpeek.link=https://headscale-ui.example.com"
+
+
+  # ----------------------------------------------------------
+  # HEADSCALE - Self-hosted Tailscale Control Server
+  # ----------------------------------------------------------
+  # Open-source implementation of the Tailscale control server.
+  #
+  # Responsibilities:
+  #   - Device registration and authentication
+  #   - Tailnet coordination
+  #   - Node discovery and key distribution
+  #   - Routing policy and DNS configuration
+  #
+  # Note: Headscale primarily coordinates connections;
+  # normal VPN traffic generally flows between devices.
+  # ----------------------------------------------------------
+
+  headscale:
+    image: headscale/headscale:latest
+    container_name: headscale
+    restart: unless-stopped
+
+    # Start the Headscale server
+    command: serve
+
+    labels:
+      # Allows Headplane to identify the correct container.
+      me.tale.headplane.target: headscale
+
+    ports:
+      # Headscale HTTP control server/API.
+      # Usually accessed via the HTTPS reverse proxy.
+      - "8080:8080"
+
+      # Optional Headscale gRPC management endpoint.
+      # Not required for normal Tailscale client operation.
+      # Avoid publicly exposing this port.
+      - "127.0.0.1:50443:50443"
+
+    volumes:
+      # Persistent database, keys, and application state
+      - ${HOME_DIR}/docker/headscale/headscale-data:/var/lib/headscale
+
+      # Server configuration and DNS records
+      - ${HOME_DIR}/docker/headscale/headscale-config:/etc/headscale
+
+    networks:
+      - headscale-network
+
+
+  # ----------------------------------------------------------
+  # NGINX PROXY MANAGER - HTTPS Reverse Proxy
+  # ----------------------------------------------------------
+  # Provides a web UI for managing:
+  #   - Reverse proxy hostnames
+  #   - SSL/TLS certificates
+  #   - HTTPS redirects
+  #   - Optional access restrictions
+  #
+  # Example proxy destinations:
+  #
+  # headscale.example.com
+  #   -> http://headscale:8080
+  #
+  # headscale-ui.example.com
+  #   -> http://headplane:3000
+  #
+  # Headscale requires a compatible proxy configuration
+  # for its control protocol.
+  # ----------------------------------------------------------
+
+  npm-headscale:
+    image: docker.io/jc21/nginx-proxy-manager:latest
+    container_name: headscale_reverse_proxy
+    restart: unless-stopped
+
+    ports:
+      # HTTP - redirects / certificate challenges
+      - "80:80"
+
+      # NPM administrative web interface
+      # Restrict this port to trusted networks.
+      - "81:81"
+
+      # HTTPS - encrypted public access
+      - "443:443"
+
+    volumes:
+      # Proxy configurations, database and settings
+      - ${HOME_DIR}/docker/headscale/nginx-proxy/data:/data
+
+      # Persistent Let's Encrypt certificates
+      - ${HOME_DIR}/docker/headscale/nginx-proxy/letsencrypt:/etc/letsencrypt
+
+    networks:
+      - headscale-network
+
+    labels:
+      # Optional Dockpeek dashboard shortcut
+      - "dockpeek.link=https://npm.example.com"
+
+
+  # ----------------------------------------------------------
+  # DUCKDNS - Dynamic DNS Updater
+  # ----------------------------------------------------------
+  # Keeps a DuckDNS hostname pointed to your public IP.
+  #
+  # Useful for residential internet connections where
+  # the public IP address changes periodically.
+  #
+  # Not required when using:
+  #   - Static public IP addresses
+  #   - Another dynamic DNS provider
+  #   - Router-based dynamic DNS updates
+  # ----------------------------------------------------------
+
+  headscale_duckdns:
+    image: lscr.io/linuxserver/duckdns:latest
+    container_name: headscale_duckdns
+    restart: unless-stopped
+
+    environment:
+      # DuckDNS subdomain without .duckdns.org
+      - SUBDOMAINS=${DUCKDNS_SUBDOMAIN}
+
+      # API token from your DuckDNS account
+      - TOKEN=${DUCKDNS_TOKEN}
+
+    volumes:
+      # Persistent DuckDNS container configuration
+      - ${HOME_DIR}/docker/headscale/duckdns/config:/config
+
+    networks:
+      - headscale-network
+
+
+  # ----------------------------------------------------------
+  # OPTIONAL - PROMETHEUS / TAILSCALE EXPORTER
+  # ----------------------------------------------------------
+  # Exposes metrics for Prometheus-compatible monitoring.
+  #
+  # Can be used with Prometheus + Grafana dashboards.
+  #
+  # Disabled by default.
+  # Uncomment if monitoring is required.
+  #
+  # Verify exporter compatibility with your Headscale
+  # version before enabling.
+  # ----------------------------------------------------------
+
+  # headscale-exporter:
+  #   image: adinhodovic/tailscale-exporter:latest
+  #   container_name: headscale-exporter
+  #   restart: unless-stopped
+  #
+  #   ports:
+  #     # Prometheus metrics endpoint
+  #     - "127.0.0.1:9250:9250"
+  #
+  #   environment:
+  #     # Public Headscale URL
+  #     HEADSCALE_ADDRESS: "https://headscale.example.com"
+  #
+  #     # Headscale API authentication token
+  #     HEADSCALE_API_KEY: "${HEADSCALE_API_KEY}"
+  #
+  #     # Validate HTTPS certificates
+  #     HEADSCALE_INSECURE: "false"
+  #
+  #   networks:
+  #     - headscale-network
+  #
+  #   depends_on:
+  #     - headscale
+
+
+# ============================================================
+# DOCKER NETWORK
+# ============================================================
+# All containers communicate over this dedicated bridge
+# network using their Docker service/container names.
+#
+# External network means Docker Compose will NOT create it.
+#
+# Create manually before first deployment:
+#
+# docker network create headscale-network
+#
+# ============================================================
+
+networks:
+  headscale-network:
+    external: true
+    name: headscale-network
